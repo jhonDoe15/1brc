@@ -1,0 +1,117 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+)
+
+type processedLine struct {
+	station     string
+	measurement float64
+}
+
+type stationAggregatedResult struct {
+	min   float64
+	max   float64
+	sum   float64
+	count float64
+}
+
+var wg sync.WaitGroup
+
+func main() {
+	file, err := os.Open("./measurements.txt")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func(file *os.File) {
+		err := file.Close()
+		if err != nil {
+			log.Print("Error closing file, resource maybe still busy")
+		}
+	}(file)
+
+	scanner := bufio.NewScanner(file)
+
+	var bufferChan = make(chan string)
+	var processedLines = make(chan processedLine)
+	wg.Add(1)
+	go processLinesFromFile(bufferChan, processedLines)
+
+	for scanner.Scan() {
+		bufferChan <- scanner.Text()
+	}
+	close(bufferChan)
+
+	wg.Wait()
+
+	wg.Add(1)
+	go processMeasurements(processedLines)
+
+	if err := scanner.Err(); err != nil {
+		log.Fatal(err)
+	}
+
+}
+
+func processLinesFromFile(c <-chan string, done chan<- processedLine) {
+	for s := range c {
+		lineParts := strings.Split(s, ";")
+		measurement, _ := strconv.ParseFloat(lineParts[1], 32)
+		done <- processedLine{lineParts[0], measurement}
+	}
+	close(done)
+	wg.Done()
+}
+
+func processMeasurements(inputMeasurements chan processedLine) {
+	var aggregationResults = make(map[string]stationAggregatedResult)
+	for line := range inputMeasurements {
+		val, ok := aggregationResults[line.station]
+		if ok {
+			updateResult(&val, line.measurement)
+		} else {
+			val = stationAggregatedResult{math.MinInt, math.MaxInt, 0, 0}
+		}
+		aggregationResults[line.station] = val
+	}
+	close(inputMeasurements)
+	wg.Done()
+	wg.Wait()
+
+	fmt.Print('{')
+	for stationName, aggResult := range aggregationResults {
+		fmt.Print(stationName, "=", aggResult.min, "/", (aggResult.sum/aggResult.count)/100, "/", aggResult.max)
+		fmt.Print(", ")
+	}
+	fmt.Print('}')
+}
+
+func updateResult(val *stationAggregatedResult, measurement float64) {
+	val.min = intMin(val.min, measurement)
+	val.max = intMax(val.max, measurement)
+	val.sum += measurement
+	val.count++
+}
+
+func intMin(currentMin float64, measurement float64) float64 {
+	if currentMin < measurement {
+		return currentMin
+	}
+
+	return measurement
+}
+
+func intMax(currentMax float64, measurement float64) float64 {
+	if currentMax > measurement {
+		return currentMax
+	}
+
+	return measurement
+}

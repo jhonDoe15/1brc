@@ -1,0 +1,384 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"github.com/dolthub/swiss"
+	//"github.com/spatialcurrent/go-math/pkg/math"
+	"io"
+	"log"
+	"math"
+	"os"
+	"runtime"
+	//"runtime/pprof"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type stationAggregatedResult struct {
+	min   int8
+	max   int8
+	sum   int64
+	count int64
+}
+
+var BufferSize = int(math.Pow(2, 26))
+
+func main() {
+	var f *os.File
+	var err error
+	wg := sync.WaitGroup{}
+
+	//// Start profiling go tool pprof -http=:8080 1brc-11.prof
+	//f, err = os.Create("1brc-16.prof")
+	//if err != nil {
+	//
+	//	fmt.Println(err)
+	//	return
+	//
+	//}
+	//err = pprof.StartCPUProfile(f)
+	//if err != nil {
+	//	return
+	//}
+	//defer pprof.StopCPUProfile()
+
+	//aggregationResults = make(chan *swiss.Map[string, *stationAggregatedResult])
+
+	start := time.Now()
+
+	f, err = os.Open("./measurements.txt")
+	if err != nil {
+		log.Fatal("Error opening measurements file, failing 😵")
+	}
+	defer func(f *os.File) {
+		err := f.Close()
+		if err != nil {
+			log.Fatal("Error closing measurements file, failing 😵")
+		}
+	}(f)
+
+	fi, err := f.Stat()
+	if err != nil {
+		// Could not obtain stat, handle error
+	}
+
+	log.Printf("The file is %s bytes long\n", Format(fi.Size()))
+
+	finalMapsToAggCount := int(float64(fi.Size()) / float64(BufferSize) * 1.1)
+	batchFinalMaps := make(chan *swiss.Map[uint64, *stationAggregatedResult], finalMapsToAggCount)
+
+	fileReader := bufio.NewReader(f)
+	readerCount := 60
+
+	wg.Add(readerCount)
+	for i := 0; i < readerCount; i++ {
+		go spawnFileIngeter(fileReader, BufferSize, batchFinalMaps, &wg)
+	}
+
+	wg.Wait()
+
+	log.Print("merging all batches results")
+	end := time.Now()
+	fmt.Println("")
+	fmt.Printf("Execution time before merging %v", end.Sub(start))
+	mergeToSingleMap(batchFinalMaps)
+	end = time.Now()
+	fmt.Println("")
+	fmt.Printf("Execution time after merging %v", end.Sub(start))
+
+}
+
+func spawnFileIngeter(fileReader *bufio.Reader, BufferSize int, batchFinalMaps chan *swiss.Map[uint64, *stationAggregatedResult], wgi *sync.WaitGroup) {
+	defer wgi.Done()
+	nr := int64(0)
+	buf := make([]byte, 0, BufferSize)
+
+	for {
+		n, err := fileReader.Read(buf[:cap(buf)])
+		buf = buf[:n] // if less than buf size is left to read
+		if n == 0 {
+			if err == nil {
+				continue
+			}
+			if err == io.EOF {
+				break
+			}
+			log.Fatal("reached EOF, failing 😵")
+		}
+
+		// Do something with buf
+		nr += int64(len(buf))
+		fileBatch := string(buf)
+
+		newlineIndex := getNextNewlineIndex(fileBatch)
+		fileBatch = fileBatch[newlineIndex:]
+
+		endNewlineIndex := getEndNewlineIndex(fileBatch)
+		fileBatch = fileBatch[:endNewlineIndex]
+
+		processFileSection(fileBatch, batchFinalMaps)
+
+		if err != nil && err != io.EOF {
+			log.Fatal("all hell broke loose, failing 😵")
+		}
+	}
+}
+
+func getEndNewlineIndex(fileBatch string) int {
+	for i := len(fileBatch) - 1; i >= 0; i-- {
+		if fileBatch[i] == 10 { // "\n"
+			return i
+		}
+	}
+	return -1
+}
+
+func getNextNewlineIndex(fileBatch string) int {
+	for i := 0; i < len(fileBatch); i++ {
+		if fileBatch[i] == 10 { // "\n"
+			return i
+		}
+	}
+	return -1
+}
+
+func mergeToSingleMap(allMaps chan *swiss.Map[uint64, *stationAggregatedResult]) {
+	mergedMapChannel := make(chan *swiss.Map[uint64, *stationAggregatedResult], 1)
+
+	mergeChannelToMap(allMaps, mergedMapChannel)
+
+	finalMap := <-mergedMapChannel
+
+	printFinalMap(finalMap)
+}
+
+func printFinalMap(finalMap *swiss.Map[uint64, *stationAggregatedResult]) {
+	mapSize := finalMap.Capacity()
+
+	var output strings.Builder
+	output.WriteString("{")
+	cnt := 1
+	finalMap.Iter(func(stationName uint64, aggResult *stationAggregatedResult) (stop bool) {
+		output.WriteString(strconv.FormatUint(stationName, 10))
+		output.WriteString("=")
+		output.WriteString(fmt.Sprintf("%d", aggResult.min))
+		output.WriteString("/")
+		output.WriteString(fmt.Sprintf("%.1f", float64(aggResult.sum)/float64(aggResult.count)))
+		output.WriteString("/")
+		output.WriteString(fmt.Sprintf("%d", aggResult.max))
+		if cnt < mapSize {
+			output.WriteString(", ")
+		}
+		cnt++
+		return false // continue
+	})
+	output.WriteString("}")
+	fmt.Print(output.String())
+}
+
+func processFileSection(fileBuffer string, results chan *swiss.Map[uint64, *stationAggregatedResult]) {
+	wg := sync.WaitGroup{}
+	lines := strings.Split(fileBuffer, "\n")
+
+	lineCount := len(lines)
+
+	cpuCount := runtime.NumCPU()
+	batchSize := lineCount / cpuCount / 2 // 40_000
+	//log.Printf("processing %s lines using %s as batch size given %d CPUs\n", Format(int64(lineCount)), Format(int64(batchSize)), cpuCount)
+	batches := make([][]string, 0, (len(lines)+batchSize-1)/batchSize)
+
+	for batchSize < len(lines) {
+		lines, batches = lines[batchSize:], append(batches, lines[0:batchSize:batchSize])
+	}
+	batches = append(batches, lines)
+	routineResults := make(chan *swiss.Map[uint64, *stationAggregatedResult], len(batches))
+
+	wg.Add(len(batches))
+	for _, batch := range batches {
+		go processInnerBatchString(batch, &wg, routineResults)
+	}
+
+	wg.Wait()
+
+	mergeChannelToMap(routineResults, results)
+}
+
+func hash(name []byte) uint64 {
+	var h uint64 = 5381
+	for _, b := range name {
+		h = (h << 5) + h + uint64(b)
+	}
+	return h
+}
+
+func mergeChannelToMap(inputChannel chan *swiss.Map[uint64, *stationAggregatedResult], resultsChannel chan *swiss.Map[uint64, *stationAggregatedResult]) {
+	c1 := <-inputChannel
+
+	for c2 := range inputChannel {
+		mergeFirstMapToSecond(c2, c1)
+		if len(inputChannel) == 0 {
+			break
+		}
+	}
+	//fmt.Println("final")
+	resultsChannel <- c1
+}
+
+func mergeFirstMapToSecond(c2 *swiss.Map[uint64, *stationAggregatedResult], c1 *swiss.Map[uint64, *stationAggregatedResult]) {
+	c2.Iter(func(k uint64, v *stationAggregatedResult) (stop bool) {
+		val, entryFound := c1.Get(k)
+		if entryFound {
+			updateResult(val, v)
+		} else {
+			val = &stationAggregatedResult{v.max, v.min, v.sum, 1}
+			c1.Put(k, val)
+		}
+		return false // continue
+	})
+}
+
+func insertEntryInBatch(c2 *swiss.Map[uint64, *stationAggregatedResult], station string, measurement int8) {
+	id := hash([]byte(station))
+	val, ok := c2.Get(id)
+	if ok {
+		updateResultInBatch(val, measurement)
+	} else {
+		val = &stationAggregatedResult{measurement, measurement, int64(measurement), 1}
+		c2.Put(id, val)
+	}
+	//c2.Put(station, val)
+}
+
+func processInnerBatchString(lineBatch []string, localWG *sync.WaitGroup, localResults chan *swiss.Map[uint64, *stationAggregatedResult]) {
+	defer localWG.Done()
+	//log.Print(len(lineBatch))
+	var batchAggResult = swiss.NewMap[uint64, *stationAggregatedResult](uint32(len(lineBatch)))
+
+	for _, line := range lineBatch {
+		measurement, station, ok := getStationAndValue(line)
+		if ok {
+			insertEntryInBatch(batchAggResult, station, measurement)
+		}
+	}
+
+	localResults <- batchAggResult
+}
+
+func getStationAndValue(line string) (int8, string, bool) {
+	var measurement int8
+	semiColonIdx := getSemiColonIndex(line)
+	if semiColonIdx == -1 {
+		return 0, "", false
+	}
+	var station = line[0:semiColonIdx]
+	var negativeNumber = false
+	// tlv;9.2 idx=3
+	station = line[0:semiColonIdx]
+
+	if line[semiColonIdx+1] == 45 { // "-"
+		negativeNumber = true
+	}
+
+	measurement = getMeasurement(line, negativeNumber, measurement, semiColonIdx)
+
+	return measurement, station, true
+}
+
+func getSemiColonIndex(line string) int {
+	sLen := len(line)
+	var startIdx = 0
+	if sLen > 5 {
+		startIdx = sLen - 6
+	}
+	for i := startIdx; i < sLen; i++ {
+		if line[i] == 59 {
+			return i
+		}
+	}
+	return -1
+}
+
+func getMeasurement(line string, negativeNumber bool, measurement int8, semiColonIdx int) int8 {
+	numberCharCount := len(line) - 1 - semiColonIdx
+	// number options
+	// negative 4		5
+	//			-1.7	-11.7
+	//			3		4
+	// positive 1.7		11.7
+	// vv;1.0
+
+	if negativeNumber {
+		if numberCharCount == 4 {
+			measurement = int8(line[semiColonIdx+2] - 48)
+		} else {
+			measurement = int8((line[semiColonIdx+2]-48)*10 + line[semiColonIdx+3] - 48)
+		}
+		measurement *= -1
+	} else {
+		if numberCharCount == 3 {
+			measurement = int8(line[semiColonIdx+1] - 48)
+		} else {
+			measurement = int8((line[semiColonIdx+1]-48)*10 + line[semiColonIdx+2] - 48)
+		}
+		measurement += 1
+	}
+	return measurement
+}
+
+func updateResult(val *stationAggregatedResult, entry *stationAggregatedResult) {
+	val.min = intMin(val.min, entry.min)
+	val.max = intMax(val.max, entry.max)
+	val.sum += entry.sum
+	val.count += entry.count
+}
+
+func updateResultInBatch(val *stationAggregatedResult, measurement int8) {
+	val.min = intMin(val.min, measurement)
+	val.max = intMax(val.max, measurement)
+	val.sum += int64(measurement)
+	val.count += 1
+}
+
+func intMin(currentMin int8, measurement int8) int8 {
+	if currentMin < measurement {
+		return currentMin
+	}
+
+	return measurement
+}
+
+func intMax(currentMax int8, measurement int8) int8 {
+	if currentMax > measurement {
+		return currentMax
+	}
+
+	return measurement
+}
+
+func Format(n int64) string {
+	in := strconv.FormatInt(n, 10)
+	numOfDigits := len(in)
+	if n < 0 {
+		numOfDigits-- // First character is the - sign (not a digit)
+	}
+	numOfCommas := (numOfDigits - 1) / 3
+
+	out := make([]byte, len(in)+numOfCommas)
+	if n < 0 {
+		in, out[0] = in[1:], '-'
+	}
+
+	for i, j, k := len(in)-1, len(out)-1, 0; ; i, j = i-1, j-1 {
+		out[j] = in[i]
+		if i == 0 {
+			return string(out)
+		}
+		if k++; k == 3 {
+			j, k = j-1, 0
+			out[j] = ','
+		}
+	}
+}

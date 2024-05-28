@@ -1,0 +1,215 @@
+package main
+
+import (
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type processedLine struct {
+	station     string
+	measurement float64
+}
+
+type stationAggregatedResult struct {
+	min   float64
+	max   float64
+	sum   float64
+	count float64
+}
+
+// var bufferChan chan string
+// var processedLines chan processedLine
+var aggregationResults chan map[string]stationAggregatedResult
+
+func main() {
+	processFile()
+}
+
+func processFile() {
+	wg := sync.WaitGroup{}
+	//wg.Add(1)
+	start := time.Now()
+
+	//bufferChan = make(chan string, 100000000)
+	//processedLines = make(chan processedLine, 1_000_000)
+	var finalResult = make(chan map[string]stationAggregatedResult)
+
+	content, err := os.ReadFile("./measurements.txt")
+	if err != nil {
+		log.Print("Error opening measurements file, failing 😵")
+	}
+
+	lines := strings.Split(string(content), "\n")
+	lineCount := len(lines)
+	//wg.Add(1)
+
+	batchSize := 40_000
+	batches := make([][]string, 0, (len(lines)+batchSize-1)/batchSize)
+
+	for batchSize < len(lines) {
+		lines, batches = lines[batchSize:], append(batches, lines[0:batchSize:batchSize])
+	}
+	batches = append(batches, lines)
+	aggregationResults = make(chan map[string]stationAggregatedResult, len(batches)+1)
+
+	wg.Add(len(batches) - 1)
+	for _, batch := range batches {
+		go processLineString(batch, &wg)
+	}
+	//wg.Done()
+	//wg.Wait()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case c1 := <-aggregationResults:
+				if len(aggregationResults) > 0 {
+					c2 := <-aggregationResults
+					//fmt.Println("aggregating")
+					for k, v := range c1 {
+						val, entryFound := c2[k]
+						if entryFound {
+							updateResult(&val, v)
+						} else {
+							val = stationAggregatedResult{v.max, v.min, v.sum, 1}
+						}
+						c2[k] = val
+					}
+					aggregationResults <- c2
+				} else {
+					fmt.Println("final")
+					finalResult <- c1
+				}
+			}
+		}
+	}()
+
+	//wg.Done()
+	wg.Wait()
+
+	mapResult := <-finalResult
+	var output strings.Builder
+	output.WriteString("{")
+	cnt := 1
+	for stationName, aggResult := range mapResult {
+		output.WriteString(stationName)
+		output.WriteString("=")
+		output.WriteString(fmt.Sprintf("%.1f", aggResult.min))
+		output.WriteString("/")
+		output.WriteString(fmt.Sprintf("%.1f", aggResult.sum/aggResult.count))
+		output.WriteString("/")
+		output.WriteString(fmt.Sprintf("%.1f", aggResult.max))
+		if cnt < len(mapResult) {
+			output.WriteString(", ")
+		}
+		cnt++
+	}
+	output.WriteString("}")
+	fmt.Print(output.String())
+
+	end := time.Now()
+	fmt.Println("")
+	fmt.Printf("Execution time %v for %d lines\n", end.Sub(start), lineCount)
+}
+
+func insertEntryInBatch(c2 map[string]stationAggregatedResult, station string, measurement float64) {
+	val, ok := c2[station]
+	if ok {
+		updateResultInBatch(&val, measurement)
+	} else {
+		val = stationAggregatedResult{measurement, measurement, measurement, 1}
+	}
+	c2[station] = val
+}
+
+func processLineString(lineBatch []string, localWG *sync.WaitGroup) {
+	defer localWG.Done()
+	var batchAggResult = make(map[string]stationAggregatedResult)
+
+	for _, line := range lineBatch {
+		lineParts := strings.Split(line, ";")
+
+		if len(lineParts) > 1 {
+			//log.Print(lineParts)
+			measurement, err1 := strconv.ParseFloat(lineParts[1], 64)
+			if err1 != nil {
+				log.Print(err1)
+			}
+			measurement = roundFloat(measurement, 1)
+			//fmt.Println(measurement)
+
+			if err1 != nil {
+				log.Fatal(err1)
+			}
+			station := lineParts[0]
+
+			insertEntryInBatch(batchAggResult, station, measurement)
+		}
+	}
+
+	aggregationResults <- batchAggResult
+}
+
+func roundFloat(val float64, precision uint) float64 {
+	ratio := math.Pow(10, float64(precision))
+	return math.Round(val*ratio) / ratio
+}
+
+func aggregateMeasurements(aggregatedMeasurements chan map[string]stationAggregatedResult, result chan map[string]stationAggregatedResult, wg *sync.WaitGroup) {
+	c1 := <-aggregatedMeasurements
+	c2 := <-aggregatedMeasurements
+
+	if c2 != nil {
+		for k, v := range c1 {
+			val, ok := c2[k]
+			if ok {
+				updateResult(&val, v)
+			} else {
+				val = stationAggregatedResult{math.MinInt, math.MaxInt, 0, 0}
+			}
+			c2[k] = val
+		}
+		aggregatedMeasurements <- c2
+	} else {
+		result <- c1
+		fmt.Print(c1)
+	}
+}
+
+func updateResult(val *stationAggregatedResult, entry stationAggregatedResult) {
+	val.min = intMin(val.min, entry.min)
+	val.max = intMax(val.max, entry.max)
+	val.sum += entry.sum
+	val.count += entry.count
+}
+
+func updateResultInBatch(val *stationAggregatedResult, measurement float64) {
+	val.min = intMin(val.min, measurement)
+	val.max = intMax(val.max, measurement)
+	val.sum += measurement
+	val.count += 1
+}
+
+func intMin(currentMin float64, measurement float64) float64 {
+	if currentMin < measurement {
+		return currentMin
+	}
+
+	return measurement
+}
+
+func intMax(currentMax float64, measurement float64) float64 {
+	if currentMax > measurement {
+		return currentMax
+	}
+
+	return measurement
+}
